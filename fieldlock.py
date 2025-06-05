@@ -39,7 +39,7 @@ APP_NAME = "FieldLock"
 EXEC_DIR = Path(sys.argv[0]).resolve().parent
 CONFIG_PATH = EXEC_DIR / "config.json"
 DEFAULT_PASS = "4123"
-DEFAULT_WALL = EXEC_DIR / "wallpaper.jpg"  # optional neighbouring file
+DEFAULT_WALL = EXEC_DIR / "wallpaper.png"  # optional neighbouring file
 
 # global flag to allow all windows to close once passcode is verified
 UNLOCKED = False

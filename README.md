@@ -42,7 +42,7 @@ To create a single-file executable you can use `pyinstaller`:
 pyinstaller --onefile --noconsole fieldlock.py
 ```
 
-Place a `wallpaper.jpg` next to the executable (or script) to customize the
+Place a `wallpaper.png` next to the executable (or script) to customize the
 background image.
 
 ## License

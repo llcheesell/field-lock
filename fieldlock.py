@@ -291,6 +291,8 @@ class LockWindow(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         self.wall_lbl = QLabel(alignment=Qt.AlignCenter)
         self.wall_lbl.setStyleSheet("background-color: black;")
+        self.wall_lbl.setMouseTracking(True)
+        self.wall_lbl.installEventFilter(self)
         v.addWidget(self.wall_lbl, 1)
         self.settings_btn = QPushButton()
         self.settings_btn.setIcon(gear_icon())
@@ -350,6 +352,12 @@ class LockWindow(QWidget):
 
     # swallow key combos inside window
     def eventFilter(self, obj, ev: QEvent):
+        if obj is self.wall_lbl:
+            if ev.type() == QEvent.MouseMove:
+                self.settings_btn.show()
+                self.hide_timer.start(2000)
+            elif ev.type() == QEvent.MouseButtonPress:
+                self.request_unlock()
         if ev.type() == QEvent.KeyPress and isinstance(ev, QKeyEvent):
             key = ev.key()
             if key in (Qt.Key_Alt, Qt.Key_F4, Qt.Key_Tab, Qt.Key_Escape):

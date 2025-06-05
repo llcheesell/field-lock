@@ -248,20 +248,20 @@ class LockWindow(QWidget):
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         self.wall_lbl = QLabel(alignment=Qt.AlignCenter)
+        self.wall_lbl.setStyleSheet("background-color: black;")
         v.addWidget(self.wall_lbl, 1)
-        if self.primary:
-            btn_row = QHBoxLayout()
-            btn_row.addStretch(1)
-            unlock = QPushButton("🔓")
-            settings = QPushButton("⚙️")
-            for b in (unlock, settings):
-                b.setFixedSize(100, 100)
-            unlock.clicked.connect(self.unlock)
-            settings.clicked.connect(self.settings)
-            btn_row.addWidget(unlock)
-            btn_row.addWidget(settings)
-            btn_row.setContentsMargins(0, 0, 20, 20)
-            v.addLayout(btn_row)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        unlock = QPushButton("🔓")
+        settings = QPushButton("⚙️")
+        for b in (unlock, settings):
+            b.setFixedSize(100, 100)
+        unlock.clicked.connect(self.unlock)
+        settings.clicked.connect(self.settings)
+        btn_row.addWidget(unlock)
+        btn_row.addWidget(settings)
+        btn_row.setContentsMargins(0, 0, 20, 20)
+        v.addLayout(btn_row)
 
     # ----------------------------------------------------------------
     def load_wall(self):
@@ -276,8 +276,12 @@ class LockWindow(QWidget):
     def rescale(self):
         if self._orig_wall.isNull():
             return
-        scaled = self._orig_wall.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        size = self.screen().geometry().size()
+        scaled = self._orig_wall.scaled(
+            size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+        )
         self.wall_lbl.setPixmap(scaled)
+        self.wall_lbl.setFixedSize(size)
 
     # ----------------------------------------------------------------
     def resizeEvent(self, _):
@@ -344,7 +348,7 @@ def main() -> None:
     primary = QGuiApplication.primaryScreen()
     windows: List[LockWindow] = []
     for sc in QGuiApplication.screens():
-        win = LockWindow(cfg, sc, primary is sc)
+        win = LockWindow(cfg, sc, sc == primary)
         windows.append(win)
     sys.exit(app.exec())
 

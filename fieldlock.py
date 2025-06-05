@@ -20,7 +20,15 @@ import math
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QPropertyAnimation
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QSize,
+    QEvent,
+    QPoint,
+    QPropertyAnimation,
+    QPointF,
+)
 from PySide6.QtGui import (
     QPixmap,
     QGuiApplication,
@@ -28,7 +36,6 @@ from PySide6.QtGui import (
     QKeyEvent,
     QPainter,
     QPainterPath,
-    QPointF,
     QIcon,
 )
 from PySide6.QtWidgets import (

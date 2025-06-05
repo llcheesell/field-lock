@@ -11,6 +11,7 @@ requires entering a numeric passcode to unlock.
 - Proper scaling on window resize
 - Works across multiple monitors
 - Keypad pops up automatically when you interact with the lock screen
+- Smooth keypad shake animation on wrong passcode
 
 ## Requirements
 

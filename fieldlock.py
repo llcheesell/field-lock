@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Qt, QTimer, QSize, QEvent
+from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QPropertyAnimation
 from PySide6.QtGui import QPixmap, QGuiApplication, QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -216,8 +216,12 @@ class KeypadDialog(QDialog):
     def shake(self):
         orig = self.pos()
         sequence = [10, -10, 6, -6, 3, -3, 0]
-        for i, offset in enumerate(sequence):
-            QTimer.singleShot(i * 20, lambda o=offset: self.move(orig.x() + o, orig.y()))
+        anim = QPropertyAnimation(self, b"pos")
+        anim.setDuration(len(sequence) * 20)
+        for i, off in enumerate(sequence):
+            anim.setKeyValueAt(i / (len(sequence) - 1), orig + QPoint(off, 0))
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+        self._anim = anim  # keep reference
 
 
 # --------------------------------------------------------------------

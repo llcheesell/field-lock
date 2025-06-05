@@ -10,6 +10,7 @@ requires entering a numeric passcode to unlock.
 - Blocks in-app key combinations like `Alt+F4`
 - Proper scaling on window resize
 - Works across multiple monitors
+- Keypad pops up automatically when you interact with the lock screen
 
 ## Requirements
 

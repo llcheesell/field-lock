@@ -41,6 +41,9 @@ CONFIG_PATH = EXEC_DIR / "config.json"
 DEFAULT_PASS = "4123"
 DEFAULT_WALL = EXEC_DIR / "wallpaper.jpg"  # optional neighbouring file
 
+# global flag to allow all windows to close once passcode is verified
+UNLOCKED = False
+
 
 # --------------------------------------------------------------------
 #                             Config helper
@@ -164,6 +167,8 @@ class KeypadDialog(QDialog):
     # ----------------------------------------------------------------
     def build_ui(self):
         grid = QGridLayout(self)
+        # prompt
+        grid.addWidget(QLabel("Enter passcode to unlock"), 0, 0, 1, 3, alignment=Qt.AlignCenter)
         # digits
         positions = [
             (1, 0), (1, 1), (1, 2),
@@ -225,7 +230,7 @@ class LockWindow(QWidget):
         super().__init__()
         self.cfg = cfg
         self.primary = primary
-        self.unlocked = False
+        self.keypad_open = False
         self.setScreen(screen)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.showFullScreen()
@@ -235,6 +240,7 @@ class LockWindow(QWidget):
 
     # ----------------------------------------------------------------
     def build_ui(self):
+        self.setStyleSheet("background-color: black;")
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         self.wall_lbl = QLabel(alignment=Qt.AlignCenter)
@@ -245,7 +251,7 @@ class LockWindow(QWidget):
             unlock = QPushButton("🔓")
             settings = QPushButton("⚙️")
             for b in (unlock, settings):
-                b.setFixedSize(60, 60)
+                b.setFixedSize(80, 80)
             unlock.clicked.connect(self.unlock)
             settings.clicked.connect(self.settings)
             btn_row.addWidget(unlock)
@@ -266,7 +272,7 @@ class LockWindow(QWidget):
     def rescale(self):
         if self._orig_wall.isNull():
             return
-        scaled = self._orig_wall.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self._orig_wall.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         self.wall_lbl.setPixmap(scaled)
 
     # ----------------------------------------------------------------
@@ -277,9 +283,16 @@ class LockWindow(QWidget):
     def focusOutEvent(self, _):
         QTimer.singleShot(50, self.raise_)
 
+    # open keypad on any interaction
+    def mousePressEvent(self, _):
+        self.request_unlock()
+
+    def keyPressEvent(self, _):
+        self.request_unlock()
+
     # guard against Alt+F4
     def closeEvent(self, e: QCloseEvent):
-        if not self.unlocked:
+        if not UNLOCKED:
             e.ignore()
 
     # swallow key combos inside window
@@ -292,10 +305,20 @@ class LockWindow(QWidget):
 
     # ----------------------------------------------------------------
     def unlock(self):
+        if self.keypad_open:
+            return
+        self.keypad_open = True
         dlg = KeypadDialog(self.cfg, self)
         if dlg.exec() == QDialog.Accepted:
-            self.unlocked = True
+            global UNLOCKED
+            UNLOCKED = True
             QApplication.quit()
+        self.keypad_open = False
+
+    def request_unlock(self):
+        # show keypad immediately upon interaction
+        if not self.keypad_open:
+            self.unlock()
 
     def settings(self):
         dlg = SettingsDialog(self.cfg, self)

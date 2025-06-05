@@ -13,6 +13,7 @@ requires entering a numeric passcode to unlock.
 - Keypad pops up automatically when you interact with the lock screen
 - Smooth keypad shake animation on wrong passcode
 - Unused screen space is filled with black so the wallpaper covers the entire monitor
+- Move the mouse to reveal a gear button for entering the settings dialog
 
 ## Requirements
 
@@ -35,7 +36,8 @@ python fieldlock.py
 
 A configuration file `config.json` will be created in the same folder on first
 run. By default the passcode is `4123`. You can change it through the settings
-window or by editing the JSON file.
+window or by editing the JSON file. Access the settings by moving the mouse and
+clicking the gear button; you'll be prompted for the passcode first.
 
 To create a single-file executable you can use `pyinstaller`:
 

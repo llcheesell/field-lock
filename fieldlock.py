@@ -16,11 +16,21 @@ from __future__ import annotations
 
 import json
 import sys
+import math
 from pathlib import Path
 from typing import List
 
 from PySide6.QtCore import Qt, QTimer, QSize, QEvent, QPoint, QPropertyAnimation
-from PySide6.QtGui import QPixmap, QGuiApplication, QCloseEvent, QKeyEvent
+from PySide6.QtGui import (
+    QPixmap,
+    QGuiApplication,
+    QCloseEvent,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPointF,
+    QIcon,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -43,6 +53,34 @@ DEFAULT_WALL = EXEC_DIR / "wallpaper.png"  # optional neighbouring file
 
 # global flag to allow all windows to close once passcode is verified
 UNLOCKED = False
+
+
+def gear_icon(size: int = 64) -> QIcon:
+    """Generate a simple black gear icon."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    center = QPointF(size / 2, size / 2)
+    teeth = 8
+    outer = size * 0.45
+    inner = size * 0.32
+    path = QPainterPath()
+    for i in range(teeth * 2):
+        ang = math.pi * i / teeth
+        r = outer if i % 2 == 0 else inner
+        x = center.x() + r * math.cos(ang)
+        y = center.y() + r * math.sin(ang)
+        if i == 0:
+            path.moveTo(x, y)
+        else:
+            path.lineTo(x, y)
+    path.closeSubpath()
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.fillPath(path, Qt.black)
+    painter.setCompositionMode(QPainter.CompositionMode_Clear)
+    painter.drawEllipse(center, size * 0.18, size * 0.18)
+    painter.end()
+    return QIcon(pm)
 
 
 # --------------------------------------------------------------------
@@ -106,11 +144,10 @@ class SettingsDialog(QDialog):
 
         # passcode
         lay.addWidget(QLabel("Change passcode (4‑8 digits):"))
-        self.old_edit, self.new_edit, self.new2_edit = (QLineEdit() for _ in range(3))
-        for e in (self.old_edit, self.new_edit, self.new2_edit):
+        self.new_edit = QLineEdit()
+        self.new2_edit = QLineEdit()
+        for e in (self.new_edit, self.new2_edit):
             e.setEchoMode(QLineEdit.Password)
-        lay.addWidget(QLabel("Current:"))
-        lay.addWidget(self.old_edit)
         lay.addWidget(QLabel("New:"))
         lay.addWidget(self.new_edit)
         lay.addWidget(QLabel("Confirm:"))
@@ -136,10 +173,7 @@ class SettingsDialog(QDialog):
 
     # ----------------------------------------------------------------
     def apply(self):
-        if any((self.old_edit.text(), self.new_edit.text(), self.new2_edit.text())):
-            if self.old_edit.text() != self.cfg.passcode:
-                QMessageBox.warning(self, APP_NAME, "Current passcode incorrect.")
-                return
+        if any((self.new_edit.text(), self.new2_edit.text())):
             if self.new_edit.text() != self.new2_edit.text():
                 QMessageBox.warning(self, APP_NAME, "New passcode mismatch.")
                 return
@@ -156,19 +190,19 @@ class SettingsDialog(QDialog):
 #                            Keypad dialogue
 # --------------------------------------------------------------------
 class KeypadDialog(QDialog):
-    def __init__(self, cfg: Config, parent: QWidget | None = None):
+    def __init__(self, cfg: Config, parent: QWidget | None = None, *, prompt: str = "Enter passcode to unlock"):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint)
         self.cfg = cfg
         self.buffer = ""
+        self.prompt = prompt
         self.build_ui()
         self.setModal(True)
 
     # ----------------------------------------------------------------
     def build_ui(self):
         grid = QGridLayout(self)
-        # prompt
-        grid.addWidget(QLabel("Enter passcode to unlock"), 0, 0, 1, 3, alignment=Qt.AlignCenter)
+        grid.addWidget(QLabel(self.prompt), 0, 0, 1, 3, alignment=Qt.AlignCenter)
         # digits
         positions = [
             (1, 0), (1, 1), (1, 2),
@@ -238,6 +272,7 @@ class LockWindow(QWidget):
         self.setScreen(screen)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.showFullScreen()
+        self.setMouseTracking(True)
         self.build_ui()
         self.load_wall()
         self.installEventFilter(self)  # intercept Alt+F4 etc.
@@ -250,18 +285,16 @@ class LockWindow(QWidget):
         self.wall_lbl = QLabel(alignment=Qt.AlignCenter)
         self.wall_lbl.setStyleSheet("background-color: black;")
         v.addWidget(self.wall_lbl, 1)
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        unlock = QPushButton("🔓")
-        settings = QPushButton("⚙️")
-        for b in (unlock, settings):
-            b.setFixedSize(100, 100)
-        unlock.clicked.connect(self.unlock)
-        settings.clicked.connect(self.settings)
-        btn_row.addWidget(unlock)
-        btn_row.addWidget(settings)
-        btn_row.setContentsMargins(0, 0, 20, 20)
-        v.addLayout(btn_row)
+        self.settings_btn = QPushButton()
+        self.settings_btn.setIcon(gear_icon())
+        self.settings_btn.setIconSize(QSize(80, 80))
+        self.settings_btn.setFixedSize(100, 100)
+        self.settings_btn.clicked.connect(self.settings)
+        self.settings_btn.hide()
+        v.addWidget(self.settings_btn, alignment=Qt.AlignHCenter | Qt.AlignBottom)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.settings_btn.hide)
 
     # ----------------------------------------------------------------
     def load_wall(self):
@@ -294,6 +327,11 @@ class LockWindow(QWidget):
     # open keypad on any interaction
     def mousePressEvent(self, _):
         self.request_unlock()
+
+    def mouseMoveEvent(self, _):
+        self.settings_btn.show()
+        self.hide_timer.start(2000)
+        super().mouseMoveEvent(_)
 
     def keyPressEvent(self, _):
         self.request_unlock()
@@ -332,9 +370,17 @@ class LockWindow(QWidget):
             self.unlock()
 
     def settings(self):
-        dlg = SettingsDialog(self.cfg, self)
-        if dlg.exec() == QDialog.Accepted:
-            self.load_wall()
+        if self.keypad_open:
+            return
+        self.keypad_open = True
+        kp = KeypadDialog(self.cfg, self, prompt="Enter passcode to change settings")
+        kp.adjustSize()
+        kp.move(self.geometry().center() - kp.rect().center())
+        if kp.exec() == QDialog.Accepted:
+            dlg = SettingsDialog(self.cfg, self)
+            if dlg.exec() == QDialog.Accepted:
+                self.load_wall()
+        self.keypad_open = False
 
 
 # --------------------------------------------------------------------

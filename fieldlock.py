@@ -158,7 +158,7 @@ class SettingsDialog(QDialog):
 class KeypadDialog(QDialog):
     def __init__(self, cfg: Config, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint)
         self.cfg = cfg
         self.buffer = ""
         self.build_ui()
@@ -255,7 +255,7 @@ class LockWindow(QWidget):
             unlock = QPushButton("🔓")
             settings = QPushButton("⚙️")
             for b in (unlock, settings):
-                b.setFixedSize(80, 80)
+                b.setFixedSize(100, 100)
             unlock.clicked.connect(self.unlock)
             settings.clicked.connect(self.settings)
             btn_row.addWidget(unlock)
@@ -313,6 +313,9 @@ class LockWindow(QWidget):
             return
         self.keypad_open = True
         dlg = KeypadDialog(self.cfg, self)
+        dlg.adjustSize()
+        # center on this window
+        dlg.move(self.geometry().center() - dlg.rect().center())
         if dlg.exec() == QDialog.Accepted:
             global UNLOCKED
             UNLOCKED = True

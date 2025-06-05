@@ -12,6 +12,7 @@ requires entering a numeric passcode to unlock.
 - Works across multiple monitors
 - Keypad pops up automatically when you interact with the lock screen
 - Smooth keypad shake animation on wrong passcode
+- Unused screen space is filled with black so the wallpaper covers the entire monitor
 
 ## Requirements
 

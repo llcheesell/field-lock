@@ -1,48 +1,80 @@
 # FieldLock
 
-FieldLock is a simple multi-monitor lock screen utility for Windows 10 and newer.
-It locks each physical screen with a fullscreen window displaying a wallpaper and
-requires entering a numeric passcode to unlock.
+Multi-monitor lock screen utility for Windows 10+.
 
 ## Features
 
-- Configurable passcode and wallpaper
-- Blocks in-app key combinations like `Alt+F4`
-- Proper scaling on window resize
-- Works across multiple monitors
+- Multi-monitor support (locks all connected displays)
+- Customizable wallpaper and passcode
+- Always-visible time display
+- 0.5s fade animations for UI elements
+- Blocks key combinations (Alt+F4, etc.)
+- Auto-hide UI after 10 seconds of inactivity
 
 ## Requirements
 
+- Windows 10 or later
 - Python 3.11+
-- [PySide6](https://pypi.org/project/PySide6/) Qt bindings
-
-Install dependencies with:
+- PySide6
 
 ```bash
-pip install PySide6
+pip install PySide6 Pillow cx_Freeze
 ```
 
 ## Usage
 
-Run the application directly:
-
+Run from source:
 ```bash
 python fieldlock.py
 ```
 
-A configuration file `config.json` will be created in the same folder on first
-run. By default the passcode is `4123`. You can change it through the settings
-window or by editing the JSON file.
-
-To create a single-file executable you can use `pyinstaller`:
-
+Build executable:
 ```bash
-pyinstaller --onefile --noconsole fieldlock.py
+python setup.py build
 ```
 
-Place a `wallpaper.jpg` next to the executable (or script) to customize the
-background image.
+Default passcode is `4123`. Move mouse or press any key to show unlock/settings buttons.
+
+## Configuration
+
+Settings are stored in `config.json`:
+```json
+{
+  "passcode": "4123",
+  "wallpaper_path": "Wallpaper.png",
+  "keypad_length": 4
+}
+```
+
+- Passcode: 4-8 digits
+- Wallpaper: PNG, JPG, or BMP format
+- Delete config.json to reset to defaults
+
+## Files
+
+```
+fieldlock.py          # Main application
+setup.py              # Build configuration
+AppIcon.png           # Application icon
+Settings.png          # Settings button (64x64)
+Unlock.png           # Unlock button (64x64)
+Wallpaper.png        # Default wallpaper
+config.json          # Auto-generated config
+```
+
+## Build
+
+```bash
+# Development
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+
+# Distribution
+python setup.py build
+# Output: build/exe.win-amd64-3.12/FieldLock.exe
+```
 
 ## License
 
-This project is provided as-is under the MIT license.
+MIT

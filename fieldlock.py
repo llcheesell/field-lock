@@ -21,11 +21,13 @@ Build
 from __future__ import annotations
 
 import json
+import platform
 import socket
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QAbstractNativeEventFilter,
     Qt,
     QEvent,
     QPoint,
@@ -37,6 +39,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QAction,
     QCloseEvent,
     QGuiApplication,
     QIcon,
@@ -53,8 +56,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -74,6 +79,7 @@ DEFAULT_PASS = "4123"
 DEFAULT_WALL = EXEC_DIR / "Wallpaper.png"
 UNLOCK_ICON_PATH = EXEC_DIR / "Unlock.png"
 SETTINGS_ICON_PATH = EXEC_DIR / "Settings.png"
+APP_ICON_PATH = EXEC_DIR / "AppIcon.png"
 
 UI_FADE_MS = 400  # control bar fade duration
 UI_HIDE_DELAY_MS = 8_000  # auto-hide after inactivity
@@ -125,6 +131,7 @@ class Config:
         self.passcode: str = DEFAULT_PASS
         self.wallpaper_path: str = str(DEFAULT_WALL)
         self.keypad_len: int = len(DEFAULT_PASS)
+        self.message: str = ""
         self._load()
 
     def _load(self) -> None:
@@ -140,6 +147,7 @@ class Config:
                 self.keypad_len = int(
                     data.get("keypad_length", len(self.passcode))
                 )
+                self.message = str(data.get("message", self.message))
         except Exception:
             pass  # use defaults
 
@@ -153,6 +161,7 @@ class Config:
             "passcode": self.passcode,
             "wallpaper_path": wp_store,
             "keypad_length": self.keypad_len,
+            "message": self.message,
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -447,6 +456,15 @@ class SettingsDialog(QDialog):
         )
         lay.addWidget(sep)
 
+        # display message
+        lay.addWidget(self._lbl("Display Message"))
+
+        self._msg_input = QLineEdit()
+        self._msg_input.setPlaceholderText("e.g. Rehearsal in progress")
+        self._msg_input.setText(self.cfg.message)
+        self._msg_input.setStyleSheet(_SETTINGS_INPUT)
+        lay.addWidget(self._msg_input)
+
         # wallpaper
         lay.addWidget(self._lbl("Wallpaper"))
 
@@ -529,6 +547,7 @@ class SettingsDialog(QDialog):
             self._wp_name.setText(Path(path).name)
 
     def _apply(self) -> None:
+        self.cfg.message = self._msg_input.text().strip()
         new_p = self._new_pass.text()
         confirm = self._confirm_pass.text()
         if new_p or confirm:
@@ -574,6 +593,7 @@ class LockWindow(QWidget):
         self._build_wallpaper()
         self._build_status_bar()
         self._build_clock()
+        self._build_message()
         self._build_controls()
         self._setup_timers()
 
@@ -694,6 +714,18 @@ class LockWindow(QWidget):
             " background: transparent; border: none;"
         )
         v.addWidget(self._date_lbl)
+
+    # ── message (below clock) ──────────────────────────────────────
+
+    def _build_message(self) -> None:
+        self._msg_lbl = QLabel(self)
+        self._msg_lbl.setAlignment(Qt.AlignCenter)
+        self._msg_lbl.setWordWrap(True)
+        self._msg_lbl.setStyleSheet(
+            "color: rgba(255,255,255,200); font-size: 28px; font-weight: 400;"
+            " background: transparent; border: none;"
+        )
+        self._msg_lbl.setText(self.cfg.message)
 
     # ── control bar (bottom) ───────────────────────────────────────
 
@@ -816,6 +848,12 @@ class LockWindow(QWidget):
             clock_h,
         )
 
+        msg_w = min(w - 40, 800)
+        clock_bottom = (h - clock_h) // 2 - 30 + clock_h
+        self._msg_lbl.setGeometry(
+            (w - msg_w) // 2, clock_bottom + 8, msg_w, 50
+        )
+
         self._ctrl_bar.setGeometry(0, h - 100, w, 80)
 
     # ── focus / close guards ───────────────────────────────────────
@@ -885,7 +923,84 @@ class LockWindow(QWidget):
             sd.move(self.geometry().center() - sd.rect().center())
             if sd.exec() == QDialog.Accepted:
                 self._load_wallpaper()
+                self._msg_lbl.setText(self.cfg.message)
         self._keypad_open = False
+
+
+    # ── lock state control ─────────────────────────────────────────
+
+    def hide_lock(self) -> None:
+        """Hide this lock window (unlock without exit)."""
+        self._clock_timer.stop()
+        self._net_timer.stop()
+        self._hide_timer.stop()
+        self.hide()
+
+    def show_lock(self) -> None:
+        """Show and re-activate this lock window."""
+        self._allow_close = False
+        self._msg_lbl.setText(self.cfg.message)
+        self._load_wallpaper()
+        self._clock_timer.start(CLOCK_INTERVAL_MS)
+        self._net_timer.start(NET_POLL_MS)
+        self._tick_clock()
+        self._poll_network()
+        self.showFullScreen()
+
+
+# ── Global hotkey helpers (Windows) ────────────────────────────────
+
+_HOTKEY_ID = 1
+_MOD_CTRL_ALT = 0x0002 | 0x0001  # MOD_CONTROL | MOD_ALT
+_VK_L = 0x4C
+
+
+def _register_hotkey() -> bool:
+    """Register Ctrl+Alt+L as a global hotkey (Windows only)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+
+        return bool(
+            ctypes.windll.user32.RegisterHotKey(
+                None, _HOTKEY_ID, _MOD_CTRL_ALT, _VK_L
+            )
+        )
+    except Exception:
+        return False
+
+
+def _unregister_hotkey() -> None:
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.UnregisterHotKey(None, _HOTKEY_ID)
+    except Exception:
+        pass
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """Intercept WM_HOTKEY on Windows to trigger re-lock."""
+
+    def __init__(self, callback) -> None:
+        super().__init__()
+        self._cb = callback
+
+    def nativeEventFilter(self, eventType, message):
+        if eventType == b"windows_generic_MSG":
+            try:
+                import ctypes.wintypes
+
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self._cb()
+                    return True, 0
+            except Exception:
+                pass
+        return False, 0
 
 
 # ── Application entry ──────────────────────────────────────────────
@@ -899,14 +1014,73 @@ def main() -> None:
     primary = QGuiApplication.primaryScreen()
     windows: list[LockWindow] = []
 
-    def on_unlocked() -> None:
+    # ── System tray ───────────────────────────────────────────────
+    tray = QSystemTrayIcon()
+    if APP_ICON_PATH.exists():
+        tray.setIcon(QIcon(str(APP_ICON_PATH)))
+    else:
+        tray.setIcon(
+            app.style().standardIcon(
+                app.style().StandardPixmap.SP_ComputerIcon
+            )
+        )
+    tray.setToolTip(APP_NAME)
+
+    tray_menu = QMenu()
+    lock_action = QAction("Lock")
+    exit_action = QAction("Exit")
+    tray_menu.addAction(lock_action)
+    tray_menu.addSeparator()
+    tray_menu.addAction(exit_action)
+    tray.setContextMenu(tray_menu)
+
+    # ── Global hotkey (Windows: Ctrl+Alt+L) ───────────────────────
+    _hotkey_ok = _register_hotkey()
+
+    def do_lock() -> None:
+        tray.hide()
+        for w in windows:
+            w.show_lock()
+
+    def do_unlock() -> None:
         for w in windows:
             w._allow_close = True
+            w.hide_lock()
+        tray.show()
+        msg = (
+            "Ctrl+Alt+L to re-lock"
+            if _hotkey_ok
+            else "Right-click to re-lock"
+        )
+        tray.showMessage(
+            APP_NAME, msg,
+            QSystemTrayIcon.MessageIcon.Information, 3000,
+        )
+
+    def do_exit() -> None:
+        _unregister_hotkey()
+        for w in windows:
+            w._allow_close = True
+            w.close()
+        tray.hide()
         app.quit()
 
+    lock_action.triggered.connect(do_lock)
+    exit_action.triggered.connect(do_exit)
+    tray.activated.connect(
+        lambda reason: do_lock()
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick
+        else None
+    )
+
+    if _hotkey_ok:
+        _hk_filter = _HotkeyFilter(do_lock)
+        app.installNativeEventFilter(_hk_filter)
+
+    # ── Create lock windows ───────────────────────────────────────
     for screen in QGuiApplication.screens():
         win = LockWindow(cfg, screen, is_primary=(screen is primary))
-        win.unlocked.connect(on_unlocked)
+        win.unlocked.connect(do_unlock)
         windows.append(win)
 
     sys.exit(app.exec())

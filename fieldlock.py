@@ -1,615 +1,914 @@
 """
-FieldLock — Simple multi‑monitor lock screen for Windows 10+
-Refactored May 2025
------------------------------------------------------------
-Highlights compared with v1.0
-• clearer structure: Config / UI / helpers are isolated
-• event‑filter blocks in‑app key combos (Alt+F4 …)
-• resize‑aware wallpaper scaling
-• unlock‑flag prevents unintended close()
-• input buffer capped to passcode length
-• config + resources resolved relative to the exe folder
+FieldLock v2.0 — Redesigned multi-monitor lock screen for Windows 10+
+=====================================================================
+A reliable screen lock application for live event environments.
 
-Build one‑file exe:  pyinstaller --onefile --noconsole fieldlock.py
+Features
+--------
+  * Full-screen lock on all connected displays
+  * Customizable wallpaper with smooth aspect-ratio scaling
+  * Large centered clock (time + date), always visible
+  * Network status bar (IP address, hostname, connection state)
+  * Numeric passcode unlock (4-8 digits) with dot indicators
+  * Settings panel (wallpaper / passcode) protected by passcode
+  * Auto-hiding control bar with fade animations
+  * Blocks Alt+F4, Tab, Escape and other escape attempts
+
+Build
+-----
+  pyinstaller --onefile --noconsole fieldlock.py
 """
 from __future__ import annotations
 
 import json
+import socket
 import sys
-import math
 from pathlib import Path
-from typing import List
 
 from PySide6.QtCore import (
     Qt,
-    QTimer,
-    QSize,
     QEvent,
     QPoint,
     QPropertyAnimation,
-    QPointF,
     QDateTime,
     QEasingCurve,
+    QSize,
+    QTimer,
+    Signal,
 )
 from PySide6.QtGui import (
-    QPixmap,
-    QGuiApplication,
     QCloseEvent,
-    QKeyEvent,
-    QPainter,
-    QPainterPath,
+    QGuiApplication,
     QIcon,
-    QFont,
+    QKeyEvent,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QWidget,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QHBoxLayout,
     QDialog,
     QFileDialog,
-    QGridLayout,
-    QMessageBox,
-    QLineEdit,
+    QFrame,
     QGraphicsOpacityEffect,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
+# ── Constants ──────────────────────────────────────────────────────
+
 APP_NAME = "FieldLock"
-EXEC_DIR = Path(sys.argv[0]).resolve().parent
+
+# Resolve resource directory (works for both script and frozen exe)
+if getattr(sys, "frozen", False):
+    EXEC_DIR = Path(sys.executable).resolve().parent
+else:
+    EXEC_DIR = Path(sys.argv[0]).resolve().parent
+
 CONFIG_PATH = EXEC_DIR / "config.json"
 DEFAULT_PASS = "4123"
-DEFAULT_WALL = EXEC_DIR / "wallpaper.png"  # optional neighbouring file
-UNLOCK_ICON = EXEC_DIR / "Unlock.png"
-SETTINGS_ICON = EXEC_DIR / "Settings.png"
+DEFAULT_WALL = EXEC_DIR / "Wallpaper.png"
+UNLOCK_ICON_PATH = EXEC_DIR / "Unlock.png"
+SETTINGS_ICON_PATH = EXEC_DIR / "Settings.png"
 
-# global flag to allow all windows to close once passcode is verified
-UNLOCKED = False
-
-
-def gear_icon(size: int = 64) -> QIcon:
-    """Generate a simple black gear icon."""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.transparent)
-    center = QPointF(size / 2, size / 2)
-    teeth = 8
-    outer = size * 0.45
-    inner = size * 0.32
-    path = QPainterPath()
-    for i in range(teeth * 2):
-        ang = math.pi * i / teeth
-        r = outer if i % 2 == 0 else inner
-        x = center.x() + r * math.cos(ang)
-        y = center.y() + r * math.sin(ang)
-        if i == 0:
-            path.moveTo(x, y)
-        else:
-            path.lineTo(x, y)
-    path.closeSubpath()
-    painter = QPainter(pm)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.fillPath(path, Qt.black)
-    painter.setCompositionMode(QPainter.CompositionMode_Clear)
-    painter.drawEllipse(center, size * 0.18, size * 0.18)
-    painter.end()
-    return QIcon(pm)
+UI_FADE_MS = 400  # control bar fade duration
+UI_HIDE_DELAY_MS = 8_000  # auto-hide after inactivity
+CLOCK_INTERVAL_MS = 1_000  # clock refresh
+NET_POLL_MS = 5_000  # network status poll
 
 
-# --------------------------------------------------------------------
-#                             Config helper
-# --------------------------------------------------------------------
+# ── Network helpers ────────────────────────────────────────────────
+
+
+def _get_local_ip() -> str:
+    """Return the primary LAN IP, or empty string on failure."""
+    # UDP connect trick — asks the OS for the outbound interface without
+    # actually sending any data.  Works on LANs without internet access.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("10.254.254.254", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+    # Fallback
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip != "127.0.0.1":
+            return ip
+    except Exception:
+        pass
+    return ""
+
+
+def _get_hostname() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:
+        return ""
+
+
+# ── Config ─────────────────────────────────────────────────────────
+
+
 class Config:
-    """Tiny JSON wrapper with sane defaults."""
+    """Persistent JSON configuration with safe defaults."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.passcode: str = DEFAULT_PASS
         self.wallpaper_path: str = str(DEFAULT_WALL)
-        self.keypad_len: int = 4
+        self.keypad_len: int = len(DEFAULT_PASS)
         self._load()
 
-    # ----------------------------------------------------------------
-    def _load(self):
+    def _load(self) -> None:
         try:
             if CONFIG_PATH.exists():
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 self.passcode = str(data.get("passcode", self.passcode))
-                self.wallpaper_path = data.get("wallpaper_path", self.wallpaper_path)
-                self.keypad_len = int(data.get("keypad_length", self.keypad_len))
-        except Exception as e:
-            print(f"Config load failed → defaults ({e})")
+                wp = data.get("wallpaper_path", self.wallpaper_path)
+                p = Path(wp)
+                if not p.is_absolute():
+                    p = EXEC_DIR / p
+                self.wallpaper_path = str(p)
+                self.keypad_len = int(
+                    data.get("keypad_length", len(self.passcode))
+                )
+        except Exception:
+            pass  # use defaults
 
-    # ----------------------------------------------------------------
-    def save(self):
+    def save(self) -> None:
+        wp = Path(self.wallpaper_path)
+        try:
+            wp_store = str(wp.relative_to(EXEC_DIR))
+        except ValueError:
+            wp_store = str(wp)
         data = {
             "passcode": self.passcode,
-            "wallpaper_path": self.wallpaper_path,
+            "wallpaper_path": wp_store,
             "keypad_length": self.keypad_len,
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-# --------------------------------------------------------------------
-#                           Settings dialogue
-# --------------------------------------------------------------------
-class SettingsDialog(QDialog):
-    def __init__(self, cfg: Config, parent: QWidget | None = None):
+# ── Keypad dialog ──────────────────────────────────────────────────
+
+_KEYPAD_DOT_FILLED = (
+    "color: white; font-size: 24px; border: none; background: transparent;"
+)
+_KEYPAD_DOT_EMPTY = (
+    "color: rgba(255,255,255,100); font-size: 24px;"
+    " border: none; background: transparent;"
+)
+_KEYPAD_BTN = """
+    QPushButton {
+        background-color: rgba(255, 255, 255, 15);
+        color: white;
+        border: 1px solid rgba(255, 255, 255, 30);
+        border-radius: 28px;
+        font-size: 22px;
+        font-weight: 500;
+    }
+    QPushButton:hover { background-color: rgba(255, 255, 255, 30); }
+    QPushButton:pressed { background-color: rgba(255, 255, 255, 50); }
+"""
+_KEYPAD_SPECIAL = """
+    QPushButton {
+        background-color: rgba(255, 255, 255, 8);
+        color: rgba(255, 255, 255, 150);
+        border: 1px solid rgba(255, 255, 255, 15);
+        border-radius: 28px;
+        font-size: 18px;
+    }
+    QPushButton:hover { background-color: rgba(255, 255, 255, 20); }
+    QPushButton:pressed { background-color: rgba(255, 255, 255, 35); }
+"""
+_KEYPAD_CANCEL = """
+    QPushButton {
+        background-color: rgba(239, 83, 80, 40);
+        color: #EF5350;
+        border: 1px solid rgba(239, 83, 80, 60);
+        border-radius: 28px;
+        font-size: 18px;
+    }
+    QPushButton:hover { background-color: rgba(239, 83, 80, 80); }
+    QPushButton:pressed { background-color: rgba(239, 83, 80, 120); }
+"""
+
+
+class KeypadDialog(QDialog):
+    """Numeric keypad with visual dot indicators for passcode entry."""
+
+    def __init__(
+        self,
+        cfg: Config,
+        parent: QWidget | None = None,
+        *,
+        prompt: str = "Enter passcode",
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"{APP_NAME} – Settings")
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.cfg = cfg
+        self.buffer: str = ""
+        self._prompt_text = prompt
+        self._build()
+        self.setModal(True)
+        self.setFixedWidth(320)
+
+    # ── build ──────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        container = QFrame(self)
+        container.setStyleSheet(
+            "QFrame { background-color: rgba(24,24,28,240);"
+            " border: 1px solid rgba(255,255,255,40);"
+            " border-radius: 16px; }"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(container)
+
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(12)
+
+        # prompt
+        prompt = QLabel(self._prompt_text)
+        prompt.setAlignment(Qt.AlignCenter)
+        prompt.setStyleSheet(
+            "color: rgba(255,255,255,200); font-size: 16px;"
+            " border: none; background: transparent;"
+        )
+        lay.addWidget(prompt)
+
+        # dot indicators
+        dots_row = QHBoxLayout()
+        dots_row.setAlignment(Qt.AlignCenter)
+        dots_row.setSpacing(12)
+        self._dots: list[QLabel] = []
+        for _ in range(self.cfg.keypad_len):
+            dot = QLabel("\u25cb")  # ○
+            dot.setAlignment(Qt.AlignCenter)
+            dot.setStyleSheet(_KEYPAD_DOT_EMPTY)
+            self._dots.append(dot)
+            dots_row.addWidget(dot)
+        lay.addLayout(dots_row)
+
+        # status
+        self._status = QLabel("")
+        self._status.setAlignment(Qt.AlignCenter)
+        self._status.setStyleSheet(
+            "color: #EF5350; font-size: 13px; min-height: 20px;"
+            " border: none; background: transparent;"
+        )
+        lay.addWidget(self._status)
+
+        # number grid
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        btn_size = QSize(56, 56)
+
+        for i in range(1, 10):
+            btn = QPushButton(str(i))
+            btn.setFixedSize(btn_size)
+            btn.setStyleSheet(_KEYPAD_BTN)
+            btn.clicked.connect(lambda _, n=i: self._push(n))
+            r, c = divmod(i - 1, 3)
+            grid.addWidget(btn, r, c, alignment=Qt.AlignCenter)
+
+        # bottom row: backspace · 0 · cancel
+        bs = QPushButton("\u232b")  # ⌫
+        bs.setFixedSize(btn_size)
+        bs.setStyleSheet(_KEYPAD_SPECIAL)
+        bs.clicked.connect(self._backspace)
+        grid.addWidget(bs, 3, 0, alignment=Qt.AlignCenter)
+
+        z = QPushButton("0")
+        z.setFixedSize(btn_size)
+        z.setStyleSheet(_KEYPAD_BTN)
+        z.clicked.connect(lambda: self._push(0))
+        grid.addWidget(z, 3, 1, alignment=Qt.AlignCenter)
+
+        cancel = QPushButton("\u2715")  # ✕
+        cancel.setFixedSize(btn_size)
+        cancel.setStyleSheet(_KEYPAD_CANCEL)
+        cancel.clicked.connect(self.reject)
+        grid.addWidget(cancel, 3, 2, alignment=Qt.AlignCenter)
+
+        lay.addLayout(grid)
+
+    # ── helpers ────────────────────────────────────────────────────
+
+    def _sync_dots(self) -> None:
+        for i, dot in enumerate(self._dots):
+            if i < len(self.buffer):
+                dot.setText("\u25cf")  # ●
+                dot.setStyleSheet(_KEYPAD_DOT_FILLED)
+            else:
+                dot.setText("\u25cb")  # ○
+                dot.setStyleSheet(_KEYPAD_DOT_EMPTY)
+
+    def _push(self, digit: int) -> None:
+        if len(self.buffer) >= self.cfg.keypad_len:
+            return
+        self.buffer += str(digit)
+        self._sync_dots()
+        self._status.setText("")
+        if len(self.buffer) == self.cfg.keypad_len:
+            QTimer.singleShot(120, self._check)
+
+    def _backspace(self) -> None:
+        if self.buffer:
+            self.buffer = self.buffer[:-1]
+            self._sync_dots()
+            self._status.setText("")
+
+    def _check(self) -> None:
+        if self.buffer == self.cfg.passcode:
+            self.accept()
+        else:
+            self._status.setText("Incorrect passcode")
+            self.buffer = ""
+            self._sync_dots()
+            self._shake()
+
+    def _shake(self) -> None:
+        origin = self.pos()
+        offsets = [12, -12, 8, -8, 4, -4, 0]
+        anim = QPropertyAnimation(self, b"pos")
+        anim.setDuration(len(offsets) * 30)
+        for i, dx in enumerate(offsets):
+            anim.setKeyValueAt(
+                i / (len(offsets) - 1), origin + QPoint(dx, 0)
+            )
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+        self._anim = anim  # prevent GC
+
+    # ── keyboard ───────────────────────────────────────────────────
+
+    def keyPressEvent(self, e: QKeyEvent) -> None:
+        if e.text().isdigit():
+            self._push(int(e.text()))
+        elif e.key() == Qt.Key_Backspace:
+            self._backspace()
+        elif e.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if len(self.buffer) == self.cfg.keypad_len:
+                self._check()
+        elif e.key() == Qt.Key_Escape:
+            self.reject()
+
+
+# ── Settings dialog ────────────────────────────────────────────────
+
+_SETTINGS_LBL = (
+    "color: rgba(255,255,255,180); font-size: 13px;"
+    " border: none; background: transparent;"
+)
+_SETTINGS_HEADING = (
+    "color: white; font-size: 18px; font-weight: 600;"
+    " border: none; background: transparent;"
+)
+_SETTINGS_INPUT = """
+    QLineEdit {
+        background-color: rgba(255,255,255,10);
+        color: white;
+        border: 1px solid rgba(255,255,255,30);
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 14px;
+    }
+    QLineEdit:focus { border: 1px solid rgba(79,195,247,150); }
+"""
+
+
+class SettingsDialog(QDialog):
+    """Configuration dialog for wallpaper and passcode."""
+
+    def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self.cfg = cfg
         self.setModal(True)
-        self.build_ui()
+        self.setFixedWidth(400)
+        self._build()
 
-    # ----------------------------------------------------------------
-    def build_ui(self):
-        lay = QVBoxLayout(self)
-        
-        # 閉じるボタンを右上に配置
+    def _build(self) -> None:
+        container = QFrame(self)
+        container.setStyleSheet(
+            "QFrame { background-color: rgba(24,24,28,245);"
+            " border: 1px solid rgba(255,255,255,40);"
+            " border-radius: 16px; }"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(container)
+
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(14)
+
+        # title bar
         title_row = QHBoxLayout()
-        title_row.addStretch(1)
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(30, 30)
+        title = QLabel(f"{APP_NAME} Settings")
+        title.setStyleSheet(_SETTINGS_HEADING)
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        close_btn = QPushButton("\u2715")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(239,83,80,60);"
+            " color: #EF5350; border: none; border-radius: 14px;"
+            " font-size: 14px; }"
+            " QPushButton:hover { background-color: rgba(239,83,80,120); }"
+        )
         close_btn.clicked.connect(self.reject)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 0, 0, 150);
-                color: white;
-                border: none;
-                border-radius: 15px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 0, 0, 200);
-            }
-        """)
         title_row.addWidget(close_btn)
         lay.addLayout(title_row)
 
+        # separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(
+            "background-color: rgba(255,255,255,20);"
+            " max-height: 1px; border: none;"
+        )
+        lay.addWidget(sep)
+
         # wallpaper
-        lay.addWidget(QLabel("Current wallpaper:"))
+        lay.addWidget(self._lbl("Wallpaper"))
+
         wp_row = QHBoxLayout()
-        self.wp_lbl = QLabel(Path(self.cfg.wallpaper_path).name)
-        pick_btn = QPushButton("Browse…")
-        pick_btn.clicked.connect(self.pick_wall)
-        wp_row.addWidget(self.wp_lbl)
-        wp_row.addWidget(pick_btn)
-        wp_row.addStretch(1)
+        self._wp_name = QLabel(Path(self.cfg.wallpaper_path).name)
+        self._wp_name.setStyleSheet(
+            "color: rgba(255,255,255,150); font-size: 14px;"
+            " border: none; background: transparent;"
+        )
+        wp_row.addWidget(self._wp_name, 1)
+
+        browse = QPushButton("Browse")
+        browse.setStyleSheet(
+            "QPushButton { background-color: rgba(255,255,255,15);"
+            " color: white; border: 1px solid rgba(255,255,255,30);"
+            " border-radius: 8px; padding: 6px 16px; font-size: 13px; }"
+            " QPushButton:hover { background-color: rgba(255,255,255,30); }"
+        )
+        browse.clicked.connect(self._pick_wallpaper)
+        wp_row.addWidget(browse)
         lay.addLayout(wp_row)
 
         # passcode
-        lay.addWidget(QLabel("Change passcode (4‑8 digits):"))
-        self.new_edit = QLineEdit()
-        self.new2_edit = QLineEdit()
-        for e in (self.new_edit, self.new2_edit):
-            e.setEchoMode(QLineEdit.Password)
-        lay.addWidget(QLabel("New:"))
-        lay.addWidget(self.new_edit)
-        lay.addWidget(QLabel("Confirm:"))
-        lay.addWidget(self.new2_edit)
+        lay.addWidget(self._lbl("Change Passcode (4\u20138 digits)"))
 
-        # buttons
+        self._new_pass = QLineEdit()
+        self._new_pass.setPlaceholderText("New passcode")
+        self._new_pass.setEchoMode(QLineEdit.Password)
+        self._new_pass.setStyleSheet(_SETTINGS_INPUT)
+        lay.addWidget(self._new_pass)
+
+        self._confirm_pass = QLineEdit()
+        self._confirm_pass.setPlaceholderText("Confirm passcode")
+        self._confirm_pass.setEchoMode(QLineEdit.Password)
+        self._confirm_pass.setStyleSheet(_SETTINGS_INPUT)
+        lay.addWidget(self._confirm_pass)
+
+        # action buttons
         btn_row = QHBoxLayout()
-        save = QPushButton("Save")
+        btn_row.addStretch()
+
         cancel = QPushButton("Cancel")
-        save.clicked.connect(self.apply)
+        cancel.setStyleSheet(
+            "QPushButton { background-color: rgba(255,255,255,10);"
+            " color: rgba(255,255,255,150);"
+            " border: 1px solid rgba(255,255,255,20);"
+            " border-radius: 8px; padding: 8px 20px; font-size: 14px; }"
+            " QPushButton:hover { background-color: rgba(255,255,255,20); }"
+        )
         cancel.clicked.connect(self.reject)
-        btn_row.addStretch(1)
-        btn_row.addWidget(save)
         btn_row.addWidget(cancel)
+
+        save = QPushButton("Save")
+        save.setStyleSheet(
+            "QPushButton { background-color: rgba(79,195,247,80);"
+            " color: white; border: 1px solid rgba(79,195,247,120);"
+            " border-radius: 8px; padding: 8px 24px;"
+            " font-size: 14px; font-weight: 600; }"
+            " QPushButton:hover { background-color: rgba(79,195,247,120); }"
+        )
+        save.clicked.connect(self._apply)
+        btn_row.addWidget(save)
         lay.addLayout(btn_row)
 
-    # ----------------------------------------------------------------
-    def pick_wall(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Wallpaper", str(EXEC_DIR), "Images (*.png *.jpg *.bmp)")
+    @staticmethod
+    def _lbl(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(_SETTINGS_LBL)
+        return lbl
+
+    def _pick_wallpaper(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Wallpaper",
+            str(EXEC_DIR),
+            "Images (*.png *.jpg *.jpeg *.bmp)",
+        )
         if path:
             self.cfg.wallpaper_path = path
-            self.wp_lbl.setText(Path(path).name)
+            self._wp_name.setText(Path(path).name)
 
-    # ----------------------------------------------------------------
-    def apply(self):
-        if any((self.new_edit.text(), self.new2_edit.text())):
-            if self.new_edit.text() != self.new2_edit.text():
-                QMessageBox.warning(self, APP_NAME, "New passcode mismatch.")
+    def _apply(self) -> None:
+        new_p = self._new_pass.text()
+        confirm = self._confirm_pass.text()
+        if new_p or confirm:
+            if new_p != confirm:
+                QMessageBox.warning(self, APP_NAME, "Passcodes do not match.")
                 return
-            if not (4 <= len(self.new_edit.text()) <= 8 and self.new_edit.text().isdigit()):
-                QMessageBox.warning(self, APP_NAME, "Passcode must be 4–8 digits.")
+            if not (4 <= len(new_p) <= 8 and new_p.isdigit()):
+                QMessageBox.warning(
+                    self, APP_NAME, "Passcode must be 4\u20138 digits."
+                )
                 return
-            self.cfg.passcode = self.new_edit.text()
-            self.cfg.keypad_len = len(self.cfg.passcode)
+            self.cfg.passcode = new_p
+            self.cfg.keypad_len = len(new_p)
         self.cfg.save()
         self.accept()
 
 
-# --------------------------------------------------------------------
-#                            Keypad dialogue
-# --------------------------------------------------------------------
-class KeypadDialog(QDialog):
-    def __init__(self, cfg: Config, parent: QWidget | None = None, *, prompt: str = "Enter passcode to unlock"):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint)
-        self.cfg = cfg
-        self.buffer = ""
-        self.prompt = prompt
-        self.build_ui()
-        self.setModal(True)
-
-    # ----------------------------------------------------------------
-    def build_ui(self):
-        grid = QGridLayout(self)
-        
-        # 閉じるボタンを右上に配置
-        close_btn = QPushButton("×")
-        close_btn.setFixedSize(30, 30)
-        close_btn.clicked.connect(self.reject)
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 0, 0, 150);
-                color: white;
-                border: none;
-                border-radius: 15px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 0, 0, 200);
-            }
-        """)
-        grid.addWidget(close_btn, 0, 2, alignment=Qt.AlignRight | Qt.AlignTop)
-        
-        grid.addWidget(QLabel(self.prompt), 0, 0, 1, 2, alignment=Qt.AlignCenter)
-        # digits
-        positions = [
-            (1, 0), (1, 1), (1, 2),
-            (2, 0), (2, 1), (2, 2),
-            (3, 0), (3, 1), (3, 2),
-            (4, 1),
-        ]
-        for num in range(10):
-            r, c = positions[num]
-            btn = QPushButton(str(num))
-            btn.setFixedSize(QSize(80, 80))
-            btn.clicked.connect(lambda _, n=num: self.push(n))
-            grid.addWidget(btn, r, c)
-        self.status_lbl = QLabel(" ")
-        grid.addWidget(self.status_lbl, 5, 0, 1, 3, alignment=Qt.AlignCenter)
-
-    # ----------------------------------------------------------------
-    def push(self, digit: int):
-        if len(self.buffer) >= self.cfg.keypad_len:
-            return
-        self.buffer += str(digit)
-        if len(self.buffer) == self.cfg.keypad_len:
-            self.check()
-
-    # ----------------------------------------------------------------
-    def keyPressEvent(self, e: QKeyEvent):
-        if e.text().isdigit():
-            self.push(int(e.text()))
-        elif e.key() == Qt.Key_Backspace:
-            self.buffer = self.buffer[:-1]
-        elif e.key() in (Qt.Key_Return, Qt.Key_Enter):
-            if len(self.buffer) == self.cfg.keypad_len:
-                self.check()
-        # ignore others
-
-    # ----------------------------------------------------------------
-    def check(self):
-        if self.buffer == self.cfg.passcode:
-            self.accept()
-        else:
-            self.status_lbl.setText("Incorrect")
-            self.buffer = ""
-            self.shake()
-
-    def shake(self):
-        orig = self.pos()
-        sequence = [10, -10, 6, -6, 3, -3, 0]
-        anim = QPropertyAnimation(self, b"pos")
-        anim.setDuration(len(sequence) * 20)
-        for i, off in enumerate(sequence):
-            anim.setKeyValueAt(i / (len(sequence) - 1), orig + QPoint(off, 0))
-        anim.start(QPropertyAnimation.DeleteWhenStopped)
-        self._anim = anim  # keep reference
+# ── Lock window ────────────────────────────────────────────────────
 
 
-# --------------------------------------------------------------------
-#                            Lock window
-# --------------------------------------------------------------------
 class LockWindow(QWidget):
-    """One window per physical screen."""
+    """Full-screen lock covering a single physical display."""
 
-    def __init__(self, cfg: Config, screen, primary: bool):
+    unlocked = Signal()
+
+    def __init__(
+        self, cfg: Config, screen, *, is_primary: bool = False
+    ) -> None:
         super().__init__()
         self.cfg = cfg
-        self.primary = primary
-        self.keypad_open = False
+        self._is_primary = is_primary
+        self._keypad_open = False
+        self._ui_visible = False
+        self._allow_close = False
+
         self.setScreen(screen)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
         self.setMouseTracking(True)
-        self.build_ui()
-        self.load_wall()
-        self.showFullScreen()
-        self.installEventFilter(self)  # intercept Alt+F4 etc.
-
-    # ----------------------------------------------------------------
-    def build_ui(self):
         self.setStyleSheet("background-color: black;")
-        
-        # 壁紙ラベルを全画面に設定
-        self.wall_lbl = QLabel(self)
-        self.wall_lbl.setAlignment(Qt.AlignCenter)
-        self.wall_lbl.setStyleSheet("background-color: black;")
-        self.wall_lbl.setMouseTracking(True)
-        self.wall_lbl.installEventFilter(self)
-        
-        # 現在時刻ラベル（左下）- 常に表示
-        self.time_lbl = QLabel(self)
-        self.time_lbl.setStyleSheet("""
-            color: white;
-            font-size: 64px;
-            font-weight: bold;
-            background-color: rgba(0, 0, 0, 100);
-            padding: 10px;
-            border-radius: 10px;
-        """)
-        # 時刻は常に表示
-        
-        # アンロックボタン（画面中央下部）
-        self.unlock_btn = QPushButton(self)
-        if UNLOCK_ICON.exists():
-            self.unlock_btn.setIcon(QIcon(str(UNLOCK_ICON)))
-        else:
-            self.unlock_btn.setText("🔓")
-        self.unlock_btn.setIconSize(QSize(64, 64))
-        self.unlock_btn.setFixedSize(80, 80)
-        self.unlock_btn.clicked.connect(self.request_unlock)
-        # hide()を削除 - 代わりにopacityで制御
-        self.unlock_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(0, 0, 0, 150);
-                border: 2px solid rgba(255, 255, 255, 100);
-                border-radius: 40px;
-                outline: none;
-            }
-            QPushButton:hover {
-                background-color: rgba(50, 50, 50, 200);
-                border: 2px solid rgba(255, 255, 255, 200);
-            }
-            QPushButton:pressed {
-                background-color: rgba(100, 100, 100, 200);
-            }
-        """)
-        
-        # 設定ボタン（画面中央下部）
-        self.settings_btn = QPushButton(self)
-        if SETTINGS_ICON.exists():
-            self.settings_btn.setIcon(QIcon(str(SETTINGS_ICON)))
-        else:
-            self.settings_btn.setIcon(gear_icon())
-        self.settings_btn.setIconSize(QSize(64, 64))
-        self.settings_btn.setFixedSize(80, 80)
-        self.settings_btn.clicked.connect(self.settings)
-        # hide()を削除 - 代わりにopacityで制御
-        self.settings_btn.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(0, 0, 0, 150);
-                border: 2px solid rgba(255, 255, 255, 100);
-                border-radius: 40px;
-                outline: none;
-            }
-            QPushButton:hover {
-                background-color: rgba(50, 50, 50, 200);
-                border: 2px solid rgba(255, 255, 255, 200);
-            }
-            QPushButton:pressed {
-                background-color: rgba(100, 100, 100, 200);
-            }
-        """)
-        
-        # ボタンにOpacityエフェクトを追加
-        self.unlock_effect = QGraphicsOpacityEffect()
-        self.unlock_btn.setGraphicsEffect(self.unlock_effect)
-        self.unlock_effect.setOpacity(0.0)  # 初期状態は透明
-        
-        self.settings_effect = QGraphicsOpacityEffect()
-        self.settings_btn.setGraphicsEffect(self.settings_effect)
-        self.settings_effect.setOpacity(0.0)  # 初期状態は透明
-        
-        # フェードアニメーション
-        self.unlock_anim = QPropertyAnimation(self.unlock_effect, b"opacity")
-        self.unlock_anim.setDuration(500)  # 0.5秒
-        self.unlock_anim.setEasingCurve(QEasingCurve.InOutQuad)
-        
-        self.settings_anim = QPropertyAnimation(self.settings_effect, b"opacity")
-        self.settings_anim.setDuration(500)  # 0.5秒
-        self.settings_anim.setEasingCurve(QEasingCurve.InOutQuad)
-        
-        # UIを隠すタイマー（10秒）
-        self.hide_timer = QTimer(self)
-        self.hide_timer.setSingleShot(True)
-        self.hide_timer.timeout.connect(self.fade_out_ui)
-        
-        # 時刻更新タイマー（1秒ごと）
-        self.time_timer = QTimer(self)
-        self.time_timer.timeout.connect(self.update_time)
-        self.time_timer.start(1000)
-        self.update_time()
-        
-        # UI状態の管理
-        self.ui_visible = False
-        
-        # ボタンを表示状態にする（透明度で見えないが、クリック可能にする）
-        self.unlock_btn.show()
-        self.settings_btn.show()
 
-    # ----------------------------------------------------------------
-    def load_wall(self):
+        self._build_wallpaper()
+        self._build_status_bar()
+        self._build_clock()
+        self._build_controls()
+        self._setup_timers()
+
+        self.installEventFilter(self)
+        self.showFullScreen()
+
+    # ── wallpaper ──────────────────────────────────────────────────
+
+    def _build_wallpaper(self) -> None:
+        self._wall_lbl = QLabel(self)
+        self._wall_lbl.setAlignment(Qt.AlignCenter)
+        self._wall_lbl.setStyleSheet("background-color: black;")
+        self._wall_lbl.setMouseTracking(True)
+        self._wall_lbl.installEventFilter(self)
+        self._load_wallpaper()
+
+    def _load_wallpaper(self) -> None:
         path = Path(self.cfg.wallpaper_path)
         pm = QPixmap(str(path)) if path.exists() else QPixmap()
         if pm.isNull():
             pm = QPixmap(1, 1)
             pm.fill(Qt.black)
         self._orig_wall = pm
-        self.rescale()
+        self._rescale_wall()
 
-    def rescale(self):
-        if not hasattr(self, '_orig_wall') or self._orig_wall.isNull():
+    def _rescale_wall(self) -> None:
+        if not hasattr(self, "_orig_wall") or self._orig_wall.isNull():
             return
-        size = self.size()
         scaled = self._orig_wall.scaled(
-            size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            self.size(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
         )
-        self.wall_lbl.setPixmap(scaled)
+        self._wall_lbl.setPixmap(scaled)
 
-    def update_time(self):
-        """現在時刻を更新"""
-        current_time = QDateTime.currentDateTime().toString("hh:mm:ss")
-        self.time_lbl.setText(current_time)
-        self.time_lbl.adjustSize()  # テキストに合わせてサイズを調整
+    # ── status bar (top) ───────────────────────────────────────────
 
-    def show_ui(self):
-        """UIコントロールをフェードインで表示"""
-        if not self.ui_visible:
-            self.ui_visible = True
-            # ボタンを確実に表示状態にする
-            self.unlock_btn.show()
-            self.settings_btn.show()
-            
-            # フェードイン
-            self.unlock_anim.setStartValue(0.0)
-            self.unlock_anim.setEndValue(1.0)
-            self.unlock_anim.start()
-            
-            self.settings_anim.setStartValue(0.0)
-            self.settings_anim.setEndValue(1.0)
-            self.settings_anim.start()
-        
-        # タイマーリセット
-        self.hide_timer.start(10000)  # 10秒後に隠す
+    def _build_status_bar(self) -> None:
+        self._status_bar = QWidget(self)
+        self._status_bar.setStyleSheet(
+            "background-color: rgba(0,0,0,160);"
+            " border-bottom: 1px solid rgba(255,255,255,20);"
+        )
+        self._status_bar.setFixedHeight(36)
 
-    def fade_out_ui(self):
-        """UIコントロールをフェードアウトで隠す"""
-        if self.ui_visible:
-            self.ui_visible = False
-            # フェードアウト
-            self.unlock_anim.setStartValue(1.0)
-            self.unlock_anim.setEndValue(0.0)
-            self.unlock_anim.start()
-            
-            self.settings_anim.setStartValue(1.0)
-            self.settings_anim.setEndValue(0.0)
-            self.settings_anim.start()
+        h = QHBoxLayout(self._status_bar)
+        h.setContentsMargins(16, 0, 16, 0)
+        h.setSpacing(8)
 
-    # ----------------------------------------------------------------
-    def resizeEvent(self, _):
-        self.rescale()
-        # 壁紙ラベルを全画面に設定
-        self.wall_lbl.setGeometry(self.rect())
-        
-        # 時刻ラベルを左下に配置
-        self.time_lbl.move(20, self.height() - self.time_lbl.height() - 20)
-        
-        # ボタンを画面中央下部に配置
-        center_x = self.width() // 2
-        bottom_y = self.height() - 120
-        
-        # アンロックボタンを中央左
-        self.unlock_btn.move(center_x - 100, bottom_y)
-        
-        # 設定ボタンを中央右
-        self.settings_btn.move(center_x + 20, bottom_y)
+        s_lbl = (
+            "color: rgba(255,255,255,180); font-size: 13px;"
+            " background: transparent; border: none;"
+        )
+        s_sep = (
+            "color: rgba(255,255,255,40); font-size: 13px;"
+            " background: transparent; border: none;"
+        )
 
-    # keep top‑most
-    def focusOutEvent(self, _):
-        QTimer.singleShot(50, self.raise_)
+        # network dot
+        self._net_dot = QLabel()
+        self._net_dot.setFixedSize(10, 10)
+        h.addWidget(self._net_dot)
 
-    # UIを表示
-    def mousePressEvent(self, event):
-        self.show_ui()
-        # ボタンがクリックされた場合の処理（透明度に関係なく）
-        if self.unlock_btn.geometry().contains(event.pos()):
-            # アンロックボタンがクリックされた
-            self.request_unlock()
-        elif self.settings_btn.geometry().contains(event.pos()):
-            # 設定ボタンがクリックされた
-            self.settings()
+        self._net_lbl = QLabel("Checking\u2026")
+        self._net_lbl.setStyleSheet(s_lbl)
+        h.addWidget(self._net_lbl)
+
+        h.addWidget(self._sep_lbl(s_sep))
+
+        self._ip_lbl = QLabel("--")
+        self._ip_lbl.setStyleSheet(s_lbl)
+        h.addWidget(self._ip_lbl)
+
+        h.addWidget(self._sep_lbl(s_sep))
+
+        self._host_lbl = QLabel(_get_hostname() or "--")
+        self._host_lbl.setStyleSheet(s_lbl)
+        h.addWidget(self._host_lbl)
+
+        h.addStretch()
+
+        app_lbl = QLabel(APP_NAME)
+        app_lbl.setStyleSheet(
+            "color: rgba(255,255,255,80); font-size: 12px;"
+            " background: transparent; border: none;"
+        )
+        h.addWidget(app_lbl)
+
+    @staticmethod
+    def _sep_lbl(style: str) -> QLabel:
+        lbl = QLabel("|")
+        lbl.setStyleSheet(style)
+        return lbl
+
+    # ── clock (center) ─────────────────────────────────────────────
+
+    def _build_clock(self) -> None:
+        self._clock_box = QWidget(self)
+        self._clock_box.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._clock_box.setStyleSheet("background: transparent;")
+
+        v = QVBoxLayout(self._clock_box)
+        v.setAlignment(Qt.AlignCenter)
+        v.setSpacing(4)
+
+        self._time_lbl = QLabel()
+        self._time_lbl.setAlignment(Qt.AlignCenter)
+        self._time_lbl.setStyleSheet(
+            "color: white; font-size: 96px; font-weight: 300;"
+            " background: transparent; border: none;"
+        )
+        v.addWidget(self._time_lbl)
+
+        self._date_lbl = QLabel()
+        self._date_lbl.setAlignment(Qt.AlignCenter)
+        self._date_lbl.setStyleSheet(
+            "color: rgba(255,255,255,160); font-size: 22px; font-weight: 300;"
+            " background: transparent; border: none;"
+        )
+        v.addWidget(self._date_lbl)
+
+    # ── control bar (bottom) ───────────────────────────────────────
+
+    def _build_controls(self) -> None:
+        self._ctrl_bar = QWidget(self)
+        self._ctrl_bar.setStyleSheet("background: transparent;")
+        self._ctrl_bar.setFixedHeight(80)
+
+        h = QHBoxLayout(self._ctrl_bar)
+        h.setAlignment(Qt.AlignCenter)
+        h.setSpacing(16)
+
+        btn_css = (
+            "QPushButton {{ background-color: rgba(0,0,0,160);"
+            " color: white; border: 1px solid rgba(255,255,255,60);"
+            " border-radius: {r}px; font-size: 14px; padding: 0 20px; }}"
+            " QPushButton:hover {{ background-color: rgba(60,60,60,200);"
+            " border: 1px solid rgba(255,255,255,120); }}"
+            " QPushButton:pressed {{ background-color: rgba(100,100,100,200); }}"
+        )
+
+        self._unlock_btn = QPushButton("  Unlock")
+        if UNLOCK_ICON_PATH.exists():
+            self._unlock_btn.setIcon(QIcon(str(UNLOCK_ICON_PATH)))
+            self._unlock_btn.setIconSize(QSize(24, 24))
+        self._unlock_btn.setFixedSize(140, 48)
+        self._unlock_btn.setStyleSheet(btn_css.format(r=24))
+        self._unlock_btn.clicked.connect(self._request_unlock)
+        h.addWidget(self._unlock_btn)
+
+        self._settings_btn = QPushButton("  Settings")
+        if SETTINGS_ICON_PATH.exists():
+            self._settings_btn.setIcon(QIcon(str(SETTINGS_ICON_PATH)))
+            self._settings_btn.setIconSize(QSize(24, 24))
+        self._settings_btn.setFixedSize(140, 48)
+        self._settings_btn.setStyleSheet(btn_css.format(r=24))
+        self._settings_btn.clicked.connect(self._open_settings)
+        h.addWidget(self._settings_btn)
+
+        # fade effect for entire control bar
+        self._ctrl_effect = QGraphicsOpacityEffect()
+        self._ctrl_bar.setGraphicsEffect(self._ctrl_effect)
+        self._ctrl_effect.setOpacity(0.0)
+
+        self._ctrl_anim = QPropertyAnimation(self._ctrl_effect, b"opacity")
+        self._ctrl_anim.setDuration(UI_FADE_MS)
+        self._ctrl_anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+    # ── timers ─────────────────────────────────────────────────────
+
+    def _setup_timers(self) -> None:
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(CLOCK_INTERVAL_MS)
+        self._tick_clock()
+
+        self._net_timer = QTimer(self)
+        self._net_timer.timeout.connect(self._poll_network)
+        self._net_timer.start(NET_POLL_MS)
+        self._poll_network()
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._fade_out)
+
+    def _tick_clock(self) -> None:
+        now = QDateTime.currentDateTime()
+        self._time_lbl.setText(now.toString("HH:mm:ss"))
+        self._date_lbl.setText(now.toString("yyyy/MM/dd  dddd"))
+
+    def _poll_network(self) -> None:
+        ip = _get_local_ip()
+        connected = bool(ip) and ip != "127.0.0.1"
+        if connected:
+            self._net_dot.setStyleSheet(
+                "background-color: #66BB6A; border-radius: 5px; border: none;"
+            )
+            self._net_lbl.setText("Connected")
+            self._ip_lbl.setText(ip)
         else:
-            # 画面の何もないところをクリックした場合
-            self.request_unlock()
+            self._net_dot.setStyleSheet(
+                "background-color: #EF5350; border-radius: 5px; border: none;"
+            )
+            self._net_lbl.setText("No Network")
+            self._ip_lbl.setText("--")
+        self._host_lbl.setText(_get_hostname() or "--")
 
-    def mouseMoveEvent(self, _):
-        self.show_ui()
-        super().mouseMoveEvent(_)
+    # ── show / hide controls ───────────────────────────────────────
 
-    def keyPressEvent(self, _):
-        self.show_ui()
+    def _show_ui(self) -> None:
+        if not self._ui_visible:
+            self._ui_visible = True
+            self._ctrl_anim.stop()
+            self._ctrl_anim.setStartValue(self._ctrl_effect.opacity())
+            self._ctrl_anim.setEndValue(1.0)
+            self._ctrl_anim.start()
+        self._hide_timer.start(UI_HIDE_DELAY_MS)
 
-    # guard against Alt+F4
-    def closeEvent(self, e: QCloseEvent):
-        if not UNLOCKED:
+    def _fade_out(self) -> None:
+        if self._ui_visible and not self._keypad_open:
+            self._ui_visible = False
+            self._ctrl_anim.stop()
+            self._ctrl_anim.setStartValue(self._ctrl_effect.opacity())
+            self._ctrl_anim.setEndValue(0.0)
+            self._ctrl_anim.start()
+
+    # ── layout on resize ───────────────────────────────────────────
+
+    def resizeEvent(self, _) -> None:
+        w, h = self.width(), self.height()
+        self._wall_lbl.setGeometry(0, 0, w, h)
+        self._rescale_wall()
+        self._status_bar.setGeometry(0, 0, w, 36)
+
+        clock_w, clock_h = 500, 160
+        self._clock_box.setGeometry(
+            (w - clock_w) // 2,
+            (h - clock_h) // 2 - 30,
+            clock_w,
+            clock_h,
+        )
+
+        self._ctrl_bar.setGeometry(0, h - 100, w, 80)
+
+    # ── focus / close guards ───────────────────────────────────────
+
+    def focusOutEvent(self, _) -> None:
+        if not self._allow_close:
+            QTimer.singleShot(50, self.raise_)
+
+    def closeEvent(self, e: QCloseEvent) -> None:
+        if not self._allow_close:
             e.ignore()
 
-    # swallow key combos inside window
-    def eventFilter(self, obj, ev: QEvent):
-        if obj is self.wall_lbl:
-            if ev.type() == QEvent.MouseMove:
-                self.show_ui()
-            elif ev.type() == QEvent.MouseButtonPress:
-                self.show_ui()
+    # ── input events ───────────────────────────────────────────────
+
+    def mousePressEvent(self, _) -> None:
+        self._show_ui()
+
+    def mouseMoveEvent(self, _) -> None:
+        self._show_ui()
+
+    def keyPressEvent(self, _) -> None:
+        self._show_ui()
+
+    def eventFilter(self, obj, ev: QEvent) -> bool:
+        # forward child label events
+        if obj is self._wall_lbl:
+            if ev.type() in (QEvent.MouseMove, QEvent.MouseButtonPress):
+                self._show_ui()
+        # block escape key combos
         if ev.type() == QEvent.KeyPress and isinstance(ev, QKeyEvent):
-            key = ev.key()
-            if key in (Qt.Key_Alt, Qt.Key_F4, Qt.Key_Tab, Qt.Key_Escape):
-                return True  # block
+            if ev.key() in (
+                Qt.Key_Alt,
+                Qt.Key_F4,
+                Qt.Key_Tab,
+                Qt.Key_Escape,
+            ):
+                return True
         return super().eventFilter(obj, ev)
 
-    # ----------------------------------------------------------------
-    def unlock(self):
-        if self.keypad_open:
+    # ── unlock / settings ──────────────────────────────────────────
+
+    def _request_unlock(self) -> None:
+        if self._keypad_open:
             return
-        self.keypad_open = True
-        dlg = KeypadDialog(self.cfg, self)
+        self._keypad_open = True
+        dlg = KeypadDialog(
+            self.cfg, self, prompt="Enter passcode to unlock"
+        )
         dlg.adjustSize()
-        # center on this window
         dlg.move(self.geometry().center() - dlg.rect().center())
         if dlg.exec() == QDialog.Accepted:
-            global UNLOCKED
-            UNLOCKED = True
-            QApplication.quit()
-        self.keypad_open = False
+            self.unlocked.emit()
+        self._keypad_open = False
 
-    def request_unlock(self):
-        # show keypad immediately upon interaction
-        if not self.keypad_open:
-            self.unlock()
-
-    def settings(self):
-        if self.keypad_open:
+    def _open_settings(self) -> None:
+        if self._keypad_open:
             return
-        self.keypad_open = True
-        kp = KeypadDialog(self.cfg, self, prompt="Enter passcode to change settings")
+        self._keypad_open = True
+        kp = KeypadDialog(
+            self.cfg, self, prompt="Enter passcode for settings"
+        )
         kp.adjustSize()
         kp.move(self.geometry().center() - kp.rect().center())
         if kp.exec() == QDialog.Accepted:
-            dlg = SettingsDialog(self.cfg, self)
-            if dlg.exec() == QDialog.Accepted:
-                self.load_wall()
-        self.keypad_open = False
+            sd = SettingsDialog(self.cfg, self)
+            sd.adjustSize()
+            sd.move(self.geometry().center() - sd.rect().center())
+            if sd.exec() == QDialog.Accepted:
+                self._load_wallpaper()
+        self._keypad_open = False
 
 
-# --------------------------------------------------------------------
-#                                 main
-# --------------------------------------------------------------------
+# ── Application entry ──────────────────────────────────────────────
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    cfg = Config()
 
+    cfg = Config()
     primary = QGuiApplication.primaryScreen()
-    windows: List[LockWindow] = []
-    for sc in QGuiApplication.screens():
-        win = LockWindow(cfg, sc, sc == primary)
+    windows: list[LockWindow] = []
+
+    def on_unlocked() -> None:
+        for w in windows:
+            w._allow_close = True
+        app.quit()
+
+    for screen in QGuiApplication.screens():
+        win = LockWindow(cfg, screen, is_primary=(screen is primary))
+        win.unlocked.connect(on_unlocked)
         windows.append(win)
+
     sys.exit(app.exec())
 
 
